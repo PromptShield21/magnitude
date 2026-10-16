@@ -64,18 +64,44 @@ fn compare_names(a: &[u16], b: &[u16]) -> io::Result<std::cmp::Ordering> {
     }
 }
 
-fn environment_name(name: &OsStr) -> io::Result<Vec<u16>> {
-    let encoded = wide(name)?;
-    // CreateProcess environment blocks preserve per-drive current directories as =C:=path.
-    let drive_directory = encoded.len() == 3
+// CreateProcess environment blocks preserve per-drive current directories as =C:=path.
+fn is_drive_directory(encoded: &[u16]) -> bool {
+    encoded.len() == 3
         && encoded[0] == b'=' as u16
         && ((b'A' as u16..=b'Z' as u16).contains(&encoded[1])
             || (b'a' as u16..=b'z' as u16).contains(&encoded[1]))
-        && encoded[2] == b':' as u16;
-    if !drive_directory && (encoded.is_empty() || encoded.contains(&(b'=' as u16))) {
+        && encoded[2] == b':' as u16
+}
+
+fn environment_name(name: &OsStr) -> io::Result<Vec<u16>> {
+    let encoded = wide(name)?;
+    if !is_drive_directory(&encoded) && (encoded.is_empty() || encoded.contains(&(b'=' as u16))) {
         return Err(invalid("Invalid Windows environment name"));
     }
     Ok(encoded)
+}
+
+/// Keep only entries a child can inherit as named variables.
+///
+/// Windows shells keep private bookkeeping in the process environment under names that begin
+/// with `=` (`=ExitCode`, `=ExitCodeAscii`, `=::`). `std::env::vars_os` reports them, but they
+/// are not variables and `environment_block` refuses such names, so a service started from cmd
+/// or PowerShell could not spawn its workers. Per-drive current directories (`=C:`) are kept.
+pub fn retain_inheritable(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .into_iter()
+        .filter(|(name, _)| {
+            let encoded: Vec<u16> = name.encode_wide().collect();
+            encoded.first() != Some(&(b'=' as u16)) || is_drive_directory(&encoded)
+        })
+        .collect()
+}
+
+/// The calling process's environment as a spawned child should inherit it.
+pub fn inherited_environment() -> Vec<(OsString, OsString)> {
+    retain_inheritable(std::env::vars_os())
 }
 
 /// Apply explicit edits to a complete environment using the same native name identity as spawning.
@@ -431,6 +457,24 @@ mod tests {
         ] {
             assert!(environment_block(&environment).is_err());
         }
+    }
+
+    #[test]
+    fn inherited_environment_drops_shell_private_entries_and_keeps_drive_directories() {
+        let inherited = retain_inheritable([
+            ("=ExitCode".into(), "00000001".into()),
+            ("=ExitCodeAscii".into(), "".into()),
+            ("=::".into(), "::\\".into()),
+            ("=C:".into(), "C:\\work".into()),
+            ("PATH".into(), "tools".into()),
+        ]);
+        assert_eq!(
+            String::from_utf16(&environment_block(&inherited).unwrap()).unwrap(),
+            "=C:=C:\\work\0PATH=tools\0\0"
+        );
+        // Edits keep the strict name rule: only inheritance drops shell-private names.
+        assert!(merge_environment(inherited, [("=ExitCode".into(), Some("1".into()))]).is_err());
+        assert!(environment_block(&inherited_environment()).is_ok());
     }
 
     #[test]

@@ -217,11 +217,13 @@ impl WorkerLauncher {
         &self,
         command: Command,
     ) -> anyhow::Result<magnitude_service_utils::windows_process::OwnedWindowsChild> {
-        use magnitude_service_utils::windows_process::{OwnedWindowsChild, merge_environment};
+        use magnitude_service_utils::windows_process::{
+            OwnedWindowsChild, inherited_environment, merge_environment,
+        };
         // This composition constructs only executable, arguments and inherited-environment edits;
         // it never sets opaque std::Command flags or a shell command line.
         let environment = merge_environment(
-            std::env::vars_os().collect(),
+            inherited_environment(),
             command
                 .get_envs()
                 .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned))),
